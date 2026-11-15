@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+# outputs and personal data - never commit your Takeout
+takeout_enriched/
+enriched/
+Takeout/
+*.zip
+*.tgz
+cookies.txt

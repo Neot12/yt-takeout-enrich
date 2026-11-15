@@ -1,0 +1,4 @@
+requests>=2.28
+yt-dlp>=2025.1.1
+beautifulsoup4>=4.11  # only for legacy HTML exports
+lxml>=4.9            # optional, faster HTML parsing
