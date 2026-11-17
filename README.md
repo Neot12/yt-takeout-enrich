@@ -51,7 +51,9 @@ The script is **resumable**. Finished items are skipped on the next run, and ite
 | `--only-commented` | off | only videos/posts that have your comments |
 | `--exclude-files SUBSTR` | – | skip Takeout files whose path contains SUBSTR |
 | `--limit N` | 0 | at most N items per kind (for testing) |
-| `--workers` / `--sleep` | 2 / 1.0 s | parallelism and global minimum delay between requests |
+| `--workers` | 2 | parallel workers (items processed in parallel) |
+| `--concurrency` / `--parallel-requests` | max(4, workers * 2) | maximum concurrent in-flight HTTP requests across all workers |
+| `--sleep` | 1.0 s | minimum delay between requests per slot (0 = no delay) |
 | `--cookies cookies.txt` | – | Netscape cookie file: age-restricted and members-only content, fewer rate limits |
 | `--no-thumbnails`, `--resized-images`, `--no-dislikes` | – | skip media, keep post images as webp, skip the RYD lookup |
 | `--lang` / `--region` | en / US | language of comment dates and labels ("3 years ago" or, with `ru`, "3 года назад"). Video and channel metadata are always fetched in English so that counts parse reliably |

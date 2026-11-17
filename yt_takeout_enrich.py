@@ -50,7 +50,7 @@ import http.cookiejar
 import io
 import json
 import logging
-
+import queue
 import re
 import sys
 import tarfile
@@ -980,20 +980,30 @@ class RateLimited(RuntimeError):
 
 
 class Throttle:
-    """Global minimum interval between requests (shared by all worker threads)."""
+    """Global concurrency and rate limiter shared across worker threads."""
 
-    def __init__(self, interval: float):
-        self.interval = interval
-        self.lock = threading.Lock()
-        self.next_at = 0.0
+    def __init__(self, interval: float, concurrency: int = 4):
+        self.interval = max(0.0, interval)
+        self.concurrency = max(1, concurrency)
+        self.slots: queue.Queue[float] = queue.Queue()
+        for _ in range(self.concurrency):
+            self.slots.put(0.0)
 
-    def wait(self) -> None:
-        with self.lock:
-            now = time.monotonic()
-            delay = self.next_at - now
-            self.next_at = max(now, self.next_at) + self.interval
+    def __enter__(self) -> Throttle:
+        now = time.monotonic()
+        ready_at = self.slots.get()
+        delay = ready_at - now
         if delay > 0:
             time.sleep(delay)
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.slots.put(time.monotonic() + self.interval)
+
+    def wait(self) -> None:
+        """Backwards compatibility: acquire and release."""
+        with self:
+            pass
 
 
 class InnerTube:
@@ -1033,9 +1043,9 @@ class InnerTube:
         payload = {"context": self.context, **body}
         last_err: Exception | None = None
         for attempt in range(self.retries):
-            self.throttle.wait()
             try:
-                r = self.s.post(self.BASE + endpoint, params={"prettyPrint": "false"}, json=payload, headers=self._auth_headers(), timeout=45)
+                with self.throttle:
+                    r = self.s.post(self.BASE + endpoint, params={"prettyPrint": "false"}, json=payload, headers=self._auth_headers(), timeout=45)
             except requests.RequestException as e:
                 last_err = e
                 time.sleep(2 * 2**attempt)
@@ -1269,12 +1279,13 @@ class Options:
     gl: str = "US"
     cookies_file: str | None = None
     sleep: float = 1.0
+    concurrency: int = 4
 
 
 class Enricher:
     def __init__(self, opt: Options):
         self.opt = opt
-        self.throttle = Throttle(opt.sleep)
+        self.throttle = Throttle(opt.sleep, opt.concurrency)
         self.cookiejar: http.cookiejar.MozillaCookieJar | None = None
         if opt.cookies_file:
             self.cookiejar = http.cookiejar.MozillaCookieJar(opt.cookies_file)
@@ -1357,8 +1368,8 @@ class Enricher:
             if existing.suffix != ".part" and not self.opt.refresh:
                 return existing.name
         try:
-            self.throttle.wait()
-            r = self.yt.s.get(url, timeout=60)
+            with self.throttle:
+                r = self.yt.s.get(url, timeout=60)
             if r.status_code != 200 or not r.content:
                 return None
             ctype = r.headers.get("content-type", "").split(";")[0].strip()
@@ -1379,17 +1390,49 @@ class Enricher:
         out: dict[str, Any] = {"sort": "top", "top": [], "user_threads": []}
         # 1. top-N
         if self.opt.top_comments > 0:
+            top_threads: list[tuple[dict, dict]] = []
             for thread, page in yt.iter_threads(endpoint, token_fn(SORT_TOP)):
                 out.setdefault("total_count_text", page.get("count_text"))
                 c = dict(thread["comment"])
-                if self.opt.top_comment_replies and c["reply_count"]:
-                    c["replies"] = yt.replies(endpoint, thread, self.opt.top_comment_replies)
-                out["top"].append(c)
-                if len(out["top"]) >= self.opt.top_comments:
+                top_threads.append((c, thread))
+                if len(top_threads) >= self.opt.top_comments:
                     break
+
+            if self.opt.top_comment_replies:
+                need_replies = [(idx, t) for idx, (c, t) in enumerate(top_threads) if c.get("reply_count")]
+
+                def fetch_reply(t: dict) -> list[dict]:
+                    try:
+                        return self.yt.replies(endpoint, t, self.opt.top_comment_replies)
+                    except RateLimited:
+                        raise
+                    except Exception as e:
+                        log.debug("failed to fetch replies: %s", e)
+                        return []
+
+                if len(need_replies) == 1:
+                    idx, t = need_replies[0]
+                    top_threads[idx][0]["replies"] = fetch_reply(t)
+                elif len(need_replies) > 1:
+                    workers = min(len(need_replies), self.opt.concurrency)
+                    with cf.ThreadPoolExecutor(max_workers=workers) as pool:
+                        futs = {pool.submit(fetch_reply, t): idx for idx, t in need_replies}
+                        for f in cf.as_completed(futs):
+                            idx = futs[f]
+                            top_threads[idx][0]["replies"] = f.result()
+
+            out["top"] = [c for c, _ in top_threads]
+
         # 2. the user's own comments, located via the "highlighted comment" mechanism
-        for uc in item.user_comments:
-            out["user_threads"].append(self._user_thread(endpoint, token_fn, uc))
+        if item.user_comments:
+            if len(item.user_comments) == 1:
+                out["user_threads"].append(self._user_thread(endpoint, token_fn, item.user_comments[0]))
+            else:
+                workers = min(len(item.user_comments), self.opt.concurrency)
+                with cf.ThreadPoolExecutor(max_workers=workers) as pool:
+                    futs = [pool.submit(self._user_thread, endpoint, token_fn, uc) for uc in item.user_comments]
+                    out["user_threads"] = [f.result() for f in futs]
+
         if not out["user_threads"]:
             del out["user_threads"]
         return out
@@ -1489,34 +1532,61 @@ class Enricher:
             if meta.get("media_type") is None and "/shorts/" in (info.get("webpage_url") or ""):
                 meta["media_type"] = "short"
             res["metadata"] = meta
-        # estimated dislikes (works for deleted videos too, from archived data)
-        if self.opt.dislikes:
-            ryd = self._ryd(vid)
-            if ryd and (info or ryd.get("dislikes") or ryd.get("likes")):
-                res.setdefault("metadata", {})["dislike_count_estimate"] = ryd.get("dislikes")
-                res["return_youtube_dislike"] = ryd
-        # thumbnail
-        if self.opt.thumbnails:
+        # Fetch estimated dislikes, thumbnail, and comments concurrently
+        def fetch_ryd() -> dict | None:
+            if self.opt.dislikes:
+                return self._ryd(vid)
+            return None
+
+        def fetch_thumb() -> tuple[str | None, str | None]:
+            if not self.opt.thumbnails:
+                return None, None
             cands = [info.get("thumbnail")] if info else []
             cands += [f"https://i.ytimg.com/vi/{vid}/maxresdefault.jpg", f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"]
             for u in cands:
                 name = self.download(u, d / "thumbnail")
                 if name:
-                    res["thumbnail_file"] = name
-                    res["thumbnail_url"] = u
-                    break
-        # comments
-        if info and (self.opt.top_comments > 0 or item.user_comments):
+                    return name, u
+            return None, None
+
+        def fetch_comm() -> dict | None:
+            if info and (self.opt.top_comments > 0 or item.user_comments):
+                return self._comments("next", lambda sort, hl=None: video_comments_token(vid, sort, hl), item)
+            return None
+
+        with cf.ThreadPoolExecutor(max_workers=3) as pool:
+            f_ryd = pool.submit(fetch_ryd)
+            f_thumb = pool.submit(fetch_thumb)
+            f_comm = pool.submit(fetch_comm)
+
+            ryd = f_ryd.result()
+            thumb_name, thumb_url = f_thumb.result()
+            comm = None
+            comm_err: Exception | None = None
             try:
-                res["comments"] = self._comments("next", lambda sort, hl=None: video_comments_token(vid, sort, hl), item)
+                comm = f_comm.result()
             except RateLimited:
                 raise
             except Exception as e:
-                res["comments"] = {"error": f"{type(e).__name__}: {e}"}
+                comm_err = e
+
+        if ryd and (info or ryd.get("dislikes") or ryd.get("likes")):
+            res.setdefault("metadata", {})["dislike_count_estimate"] = ryd.get("dislikes")
+            res["return_youtube_dislike"] = ryd
+
+        if thumb_name:
+            res["thumbnail_file"] = thumb_name
+            res["thumbnail_url"] = thumb_url
+
+        if comm is not None:
+            res["comments"] = comm
+        elif comm_err is not None:
+            res["comments"] = {"error": f"{type(comm_err).__name__}: {comm_err}"}
 
     def _ryd(self, vid: str) -> dict | None:
         try:
-            r = self.yt.s.get("https://returnyoutubedislikeapi.com/votes", params={"videoId": vid}, timeout=20)
+            with self.throttle:
+                r = self.yt.s.get("https://returnyoutubedislikeapi.com/votes", params={"videoId": vid}, timeout=20)
             if r.status_code == 200:
                 j = r.json()
                 return {k: j.get(k) for k in ("likes", "dislikes", "rating", "viewCount", "deleted", "dateCreated")}
@@ -1525,6 +1595,12 @@ class Enricher:
         return None
 
     # ---------------- post ----------------
+
+    def _download_post_image(self, i: int, u: str, d: Path) -> str | None:
+        name = None
+        if self.opt.original_images and "=" in u and ("ggpht.com" in u or "googleusercontent.com" in u):
+            name = self.download(u.split("=")[0] + "=s0", d / f"image_{i}")
+        return name or self.download(u, d / f"image_{i}")
 
     def _post(self, item: Item, d: Path, res: dict) -> None:
         res["url"] = f"https://www.youtube.com/post/{item.id}"
@@ -1536,14 +1612,13 @@ class Enricher:
         post = got["post"]
         res["post"] = post
         if self.opt.thumbnails and post["images"]:
-            files = []
-            for i, u in enumerate(post["images"], 1):
-                name = None
-                if self.opt.original_images and "=" in u and ("ggpht.com" in u or "googleusercontent.com" in u):
-                    name = self.download(u.split("=")[0] + "=s0", d / f"image_{i}")
-                name = name or self.download(u, d / f"image_{i}")
-                files.append(name)
-            res["image_files"] = files
+            if len(post["images"]) == 1:
+                res["image_files"] = [self._download_post_image(1, post["images"][0], d)]
+            else:
+                workers = min(len(post["images"]), self.opt.concurrency)
+                with cf.ThreadPoolExecutor(max_workers=workers) as pool:
+                    futs = [pool.submit(self._download_post_image, i, u, d) for i, u in enumerate(post["images"], 1)]
+                    res["image_files"] = [f.result() for f in futs]
         ucid = post["author"].get("channel_id")
         if ucid and (self.opt.top_comments > 0 or item.user_comments):
             try:
@@ -1577,10 +1652,19 @@ class Enricher:
         res["banner_url"] = thumbs.get("banner_uncropped")
         res["avatar_url"] = thumbs.get("avatar_uncropped")
         if self.opt.thumbnails:
+            downloads: list[tuple[str, str, Path]] = []
             if res["banner_url"]:
-                res["banner_file"] = self.download(res["banner_url"], d / "banner")
+                downloads.append(("banner_file", res["banner_url"], d / "banner"))
             if res["avatar_url"]:
-                res["avatar_file"] = self.download(res["avatar_url"], d / "avatar")
+                downloads.append(("avatar_file", res["avatar_url"], d / "avatar"))
+            if len(downloads) == 1:
+                key, u, dest = downloads[0]
+                res[key] = self.download(u, dest)
+            elif len(downloads) > 1:
+                with cf.ThreadPoolExecutor(max_workers=len(downloads)) as pool:
+                    futs = {pool.submit(self.download, u, dest): key for key, u, dest in downloads}
+                    for f in cf.as_completed(futs):
+                        res[futs[f]] = f.result()
 
 
 class _YdlLogger:
@@ -1668,8 +1752,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--exclude-files", action="append", default=[], metavar="SUBSTR",
                     help="ignore Takeout files whose path contains SUBSTR, e.g. 'watch-history' (repeatable)")
     ap.add_argument("--limit", type=int, default=0, help="process at most N items per kind (0 = no limit)")
-    ap.add_argument("--workers", type=int, default=2, help="parallel workers")
-    ap.add_argument("--sleep", type=float, default=1.0, help="minimum seconds between requests (all workers)")
+    ap.add_argument("--workers", type=int, default=2, help="parallel workers (items processed in parallel)")
+    ap.add_argument(
+        "--concurrency",
+        "--parallel-requests",
+        type=int,
+        default=None,
+        help="maximum concurrent in-flight HTTP requests across all workers (default: max(4, workers * 2))",
+    )
+    ap.add_argument("--sleep", type=float, default=1.0, help="minimum seconds between requests per slot (0 = no delay)")
     ap.add_argument("--no-thumbnails", action="store_true", help="skip downloading thumbnails/banners/post images")
     ap.add_argument("--resized-images", action="store_true", help="save post images as served (webp) instead of originals")
     ap.add_argument("--no-dislikes", action="store_true", help="skip the Return YouTube Dislike lookup")
@@ -1737,6 +1828,8 @@ def main(argv: list[str] | None = None) -> int:
             log.error("yt-dlp is required for video/channel metadata: pip install -U yt-dlp")
             return 1
 
+    concurrency = args.concurrency if args.concurrency is not None else max(4, args.workers * 2)
+
     enr = Enricher(
         Options(
             out=out,
@@ -1751,10 +1844,18 @@ def main(argv: list[str] | None = None) -> int:
             gl=args.region,
             cookies_file=args.cookies,
             sleep=args.sleep,
+            concurrency=concurrency,
         )
     )
     pending = [i for i in todo if not enr.done(i)]
-    log.info("%d items to process (%d already done)", len(pending), len(todo) - len(pending))
+    log.info(
+        "%d items to process (%d already done) with %d item workers, max %d concurrent requests (sleep=%.1fs)",
+        len(pending),
+        len(todo) - len(pending),
+        args.workers,
+        concurrency,
+        args.sleep,
+    )
 
     stats: dict[str, int] = {}
     stop = threading.Event()
@@ -1780,7 +1881,13 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         with cf.ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
-            list(ex.map(work, pending))
+            futures = [ex.submit(work, item) for item in pending]
+            for f in cf.as_completed(futures):
+                if stop.is_set():
+                    for remaining in futures:
+                        remaining.cancel()
+                    break
+                f.result()
     except KeyboardInterrupt:
         stop.set()
         log.warning("Interrupted - progress is saved, re-run to resume.")
