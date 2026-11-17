@@ -1275,6 +1275,8 @@ class Options:
     dislikes: bool = True
     original_images: bool = True
     refresh: bool = False
+    retry_unavailable: bool = False
+    retry_unavailable_videos: bool = False
     hl: str = "en"
     gl: str = "US"
     cookies_file: str | None = None
@@ -1331,7 +1333,13 @@ class Enricher:
         if self.opt.refresh or not f.exists():
             return False
         try:
-            return json.loads(f.read_text("utf-8")).get("status") in ("ok", "unavailable")
+            status = json.loads(f.read_text("utf-8")).get("status")
+            if status == "unavailable":
+                if self.opt.retry_unavailable:
+                    return False
+                if self.opt.retry_unavailable_videos and item.kind == "video":
+                    return False
+            return status in ("ok", "unavailable")
         except ValueError:
             return False
 
@@ -1509,6 +1517,10 @@ class Enricher:
             res["error"] = _clean_ydl_msg(reasons[-1]) if reasons else "video unavailable"
             info = None
         if info is None:
+            if not res.get("error") or res["error"] == "video unavailable":
+                reasons = [m for m in ydl.params["logger"].messages if "429" not in m and "JavaScript" not in m]
+                if reasons:
+                    res["error"] = _clean_ydl_msg(reasons[-1])
             res["status"] = "unavailable"
             res.setdefault("error", "video unavailable")
             if BOT_CHECK_RE.search(res["error"]):
@@ -1692,6 +1704,7 @@ def _clean_ydl_msg(msg: str) -> str:
     msg = re.sub(r"^(ERROR|WARNING):\s*", "", msg.strip())
     msg = re.sub(r"^\[[\w:]+\]\s*(?:[\w-]+:\s*)?", "", msg)
     msg = re.split(r"\.?\s+Use --cookies", msg)[0]  # drop yt-dlp's CLI advice
+    msg = " ".join(msg.split())
     return msg.strip()
 
 
@@ -1768,12 +1781,23 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--lang", default="en", help="interface language for relative dates/labels")
     ap.add_argument("--region", default="US", help="content region")
     ap.add_argument("--refresh", action="store_true", help="re-fetch items that were already saved")
+    ap.add_argument(
+        "--retry-unavailable",
+        "--refresh-unavailable",
+        action="store_true",
+        help="re-parse all items previously marked as unavailable (videos, posts, channels)",
+    )
+    ap.add_argument(
+        "--retry-unavailable-videos",
+        action="store_true",
+        help="re-parse only videos previously marked as unavailable (e.g. to retry with cookies)",
+    )
     ap.add_argument("--dry-run", action="store_true", help="only parse Takeout and write inventory.json")
-    ap.add_argument("-v", "--verbose", action="count", default=0)
+    ap.add_argument("-v", "--verbose", action="count", default=0, help="verbose output: show reasons, item details, and debug logs")
     args = ap.parse_args(argv)
 
     logging.basicConfig(
-        level=logging.DEBUG if args.verbose > 1 else logging.INFO,
+        level=logging.DEBUG if args.verbose > 0 else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(message)s",
         datefmt="%H:%M:%S",
     )
@@ -1840,6 +1864,8 @@ def main(argv: list[str] | None = None) -> int:
             dislikes=not args.no_dislikes,
             original_images=not args.resized_images,
             refresh=args.refresh,
+            retry_unavailable=args.retry_unavailable,
+            retry_unavailable_videos=args.retry_unavailable_videos,
             hl=args.lang,
             gl=args.region,
             cookies_file=args.cookies,
@@ -1848,6 +1874,19 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     pending = [i for i in todo if not enr.done(i)]
+    if args.retry_unavailable or args.retry_unavailable_videos:
+        retrying_unavailable = 0
+        for i in pending:
+            f = enr.item_dir(i) / "info.json"
+            if f.exists():
+                try:
+                    if json.loads(f.read_text("utf-8")).get("status") == "unavailable":
+                        retrying_unavailable += 1
+                except Exception:
+                    pass
+        if retrying_unavailable:
+            log.info("Retrying %d items previously marked as unavailable.", retrying_unavailable)
+
     log.info(
         "%d items to process (%d already done) with %d item workers, max %d concurrent requests (sleep=%.1fs)",
         len(pending),
@@ -1858,6 +1897,8 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     stats: dict[str, int] = {}
+    unavailable_reasons: dict[str, int] = {}
+    stats_lock = threading.Lock()
     stop = threading.Event()
 
     def work(item: Item) -> None:
@@ -1871,13 +1912,36 @@ def main(argv: list[str] | None = None) -> int:
             stop.set()
             return
         st = r.get("status", "?")
-        stats[st] = stats.get(st, 0) + 1
+        err = r.get("error")
+        clean_err = " ".join(str(err).split()) if err else ""
+        with stats_lock:
+            stats[st] = stats.get(st, 0) + 1
+            if st == "unavailable" and clean_err:
+                unavailable_reasons[clean_err] = unavailable_reasons.get(clean_err, 0) + 1
+
         title = (r.get("metadata") or {}).get("title") or ((r.get("post") or {}).get("text") or "")[:60] or item.title or ""
         extra = ""
         ut = (r.get("comments") or {}).get("user_threads")
         if ut:
             extra = f" | your comments found: {sum(1 for t in ut if t.get('status') == 'ok')}/{len(ut)}"
-        log.info("[%s] %-7s %s %s%s", st, item.kind, item.id, title[:60].replace("\n", " "), extra)
+        reason = f" | reason: {clean_err}" if clean_err and (st in ("unavailable", "error") or args.verbose) else ""
+        log.info("[%s] %-7s %s %s%s%s", st, item.kind, item.id, title[:60].replace("\n", " "), extra, reason)
+        if args.verbose and st == "ok":
+            meta = r.get("metadata") or {}
+            details = []
+            if meta.get("duration_string"):
+                details.append(meta["duration_string"])
+            if meta.get("view_count") is not None:
+                details.append(f"{meta['view_count']:,} views")
+            if meta.get("like_count") is not None:
+                details.append(f"{meta['like_count']:,} likes")
+            if meta.get("dislike_count_estimate") is not None:
+                details.append(f"~{meta['dislike_count_estimate']:,} dislikes")
+            comm_cnt = len((r.get("comments") or {}).get("top", []))
+            if comm_cnt:
+                details.append(f"{comm_cnt} top comments")
+            if details:
+                log.debug("       ↳ %s", ", ".join(details))
 
     try:
         with cf.ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
@@ -1893,6 +1957,12 @@ def main(argv: list[str] | None = None) -> int:
         log.warning("Interrupted - progress is saved, re-run to resume.")
     write_summary(out, inv)
     log.info("Done: %s. Output in %s", ", ".join(f"{k}={v}" for k, v in sorted(stats.items())) or "nothing new", out.resolve())
+    if unavailable_reasons:
+        sorted_reasons = sorted(unavailable_reasons.items(), key=lambda x: -x[1])
+        breakdown = "; ".join(f"{count}x '{reason}'" for reason, count in sorted_reasons[:5])
+        if len(sorted_reasons) > 5:
+            breakdown += f"; and {len(sorted_reasons) - 5} more"
+        log.info("Unavailable breakdown: %s", breakdown)
     return 2 if stop.is_set() else 0
 
 

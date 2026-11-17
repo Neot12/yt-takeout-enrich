@@ -38,7 +38,7 @@ python yt_takeout_enrich.py Takeout --exclude-files watch-history --exclude-file
 python yt_takeout_enrich.py Takeout --exclude-files история-просмотров      # Russian export
 ```
 
-The script is **resumable**. Finished items are skipped on the next run, and items that failed with an error are retried. If YouTube starts rate-limiting, the script stops cleanly and you can just run it again later. Videos and posts you commented on are processed first.
+The script is **resumable**. Finished items are skipped on the next run, and items that failed with an error are retried. If YouTube starts rate-limiting, the script stops cleanly and you can just run it again later. Videos and posts you commented on are processed first. Use `--retry-unavailable` (or `--retry-unavailable-videos`) to re-parse items that were previously marked as unavailable (e.g. after adding `--cookies`).
 
 ### Main options
 
@@ -55,8 +55,11 @@ The script is **resumable**. Finished items are skipped on the next run, and ite
 | `--concurrency` / `--parallel-requests` | max(4, workers * 2) | maximum concurrent in-flight HTTP requests across all workers |
 | `--sleep` | 1.0 s | minimum delay between requests per slot (0 = no delay) |
 | `--cookies cookies.txt` | – | Netscape cookie file: age-restricted and members-only content, fewer rate limits |
+| `--retry-unavailable` | off | re-parse all items previously marked as unavailable (videos, posts, channels) |
+| `--retry-unavailable-videos` | off | re-parse only videos previously marked as unavailable |
 | `--no-thumbnails`, `--resized-images`, `--no-dislikes` | – | skip media, keep post images as webp, skip the RYD lookup |
 | `--lang` / `--region` | en / US | language of comment dates and labels ("3 years ago" or, with `ru`, "3 года назад"). Video and channel metadata are always fetched in English so that counts parse reliably |
+| `-v / --verbose` | off | verbose output: displays reasons, video stats, and debug logs (use `-vv` for library debug) |
 
 ## Output
 
