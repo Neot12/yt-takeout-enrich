@@ -35,7 +35,11 @@ github.com/purarue/google_takeout_parser and Google's Data Portability schema
 'takeoutSegments' comment text, legacy my-comments.html, watch-history
 json/html, subscriptions.csv, playlist CSVs, own posts CSV).
 
-Output layout (re-running resumes; finished items are skipped):
+What is fetched can be chosen per part (--include / --exclude); every part's
+status and options are recorded in info.json, so a re-run fetches exactly the
+parts that are missing, failed, or were fetched with insufficient options.
+
+Output layout:
 
   OUT/inventory.json              everything extracted from Takeout
   OUT/summary.csv                 one row per enriched item
@@ -73,7 +77,7 @@ from typing import Any, Callable, Iterable, Iterator
 import requests
 import requests.adapters
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 log = logging.getLogger("yt_takeout_enrich")
 
 csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
@@ -1362,7 +1366,10 @@ class AdaptiveState:
         (+25% after 6 h, dropped after 3 days) because YouTube's limits change."""
         s = self.data["limiters"].get(name) or {}
         initial = s.get("limit")
-        initial = max(1.0, initial * 0.8) if isinstance(initial, (int, float)) else default
+        # a learned limit above the default is reused with a safety margin; lower
+        # values are not (short runs never grow the limit, and a throttling server
+        # is remembered by the ceiling, not by the limit)
+        initial = max(default, initial * 0.8) if isinstance(initial, (int, float)) else default
         ceiling = s.get("ceiling")
         if ceiling and s.get("ceiling_at"):
             try:
@@ -1402,8 +1409,11 @@ class AdaptiveState:
             }
             if snap["throttles"]:
                 entry["ceiling_at"] = now_iso()
-            if lim.fixed:  # a user-forced value says nothing about the server
+            if lim.fixed or snap["requests"] < 20:
+                # a user-forced value says nothing about the server, and a few
+                # requests are not enough evidence to replace the learned limit
                 entry["limit"] = old.get("limit", entry["limit"])
+                entry["peak_limit"] = old.get("peak_limit", entry["peak_limit"])
             prev[name] = entry
         if governor is not None and governor.done:
             g = governor.snapshot()
@@ -1839,18 +1849,66 @@ class InnerTube:
 # --------------------------------------------------------------------------------------
 
 
+# --------------------------------------------------------------------------------------
+# Parts: what is fetched for each item, and how completion is tracked
+# --------------------------------------------------------------------------------------
+
+PARTS: dict[str, tuple[str, ...]] = {
+    "video": ("metadata", "thumbnail", "dislikes", "top-comments", "my-comments", "subtitles", "lyrics"),
+    "post": ("metadata", "images", "top-comments", "my-comments"),
+    "channel": ("metadata", "banner", "avatar"),
+}
+ALL_PARTS: tuple[str, ...] = tuple(dict.fromkeys(p for ps in PARTS.values() for p in ps))
+PART_GROUPS: dict[str, tuple[str, ...]] = {
+    "all": ALL_PARTS,
+    "comments": ("top-comments", "my-comments"),
+    "media": ("thumbnail", "images", "banner", "avatar"),
+    "top": ("top-comments",),
+    "my": ("my-comments",),
+    "mine": ("my-comments",),
+    "user-comments": ("my-comments",),
+    "info": ("metadata",),
+    "subs": ("subtitles",),
+    "captions": ("subtitles",),
+    "rydislikes": ("dislikes",),
+    "post-images": ("images",),
+}
+# a part is complete with one of these statuses (and options that cover the current ones)
+PART_DONE = ("ok", "none", "skipped")  # none = nothing to fetch, skipped = not applicable (lyrics of non-music)
+
+
+def parse_parts(spec: str) -> set[str]:
+    """'subtitle,comment' -> {'subtitles', 'top-comments', 'my-comments'}; singular/plural and _/- are accepted."""
+    out: set[str] = set()
+    for raw in spec.split(","):
+        name = raw.strip().lower().replace("_", "-").replace(" ", "-")
+        if not name:
+            continue
+        for cand in (name, name + "s", name[:-1] if name.endswith("s") else name):
+            if cand in PART_GROUPS:
+                out.update(PART_GROUPS[cand])
+                break
+            if cand in ALL_PARTS:
+                out.add(cand)
+                break
+        else:
+            raise argparse.ArgumentTypeError(
+                f"unknown part {raw.strip()!r}; valid: {', '.join(ALL_PARTS)} (groups: {', '.join(PART_GROUPS)})"
+            )
+    return out
+
+
 @dataclass
 class Options:
     out: Path
+    parts: frozenset[str] = frozenset(ALL_PARTS)
     top_comments: int = 20
     top_comment_replies: int = 0
     max_replies: int = 100
-    thumbnails: bool = True
-    dislikes: bool = True
     original_images: bool = True
-    subs: str = "auto"  # none | manual | auto (manual + auto-generated in the original language)
+    subs: str = "auto"  # manual | auto (manual + auto-generated in the original language)
     sub_langs: tuple[str, ...] = ()  # empty = all
-    lyrics: str = "auto"  # none | auto (music-like videos) | all
+    lyrics: str = "auto"  # auto (music-like videos) | all
     refresh: bool = False
     retry_unavailable: bool = False
     retry_unavailable_videos: bool = False
@@ -1858,13 +1916,90 @@ class Options:
     gl: str = "US"
     cookies_file: str | None = None
 
+    def selected(self, kind: str) -> list[str]:
+        return [p for p in PARTS[kind] if p in self.parts]
 
-DONE_STATUSES = ("ok", "unavailable")  # "error" and "partial" are retried on the next run
+    def part_params(self, part: str) -> dict:
+        """Options a part's result depends on; stored with the part."""
+        if part == "top-comments":
+            return {"n": self.top_comments, "replies": self.top_comment_replies}
+        if part == "my-comments":
+            return {"max_replies": self.max_replies}
+        if part == "subtitles":
+            return {"mode": self.subs, "langs": sorted(self.sub_langs)}
+        if part == "lyrics":
+            return {"mode": self.lyrics}
+        if part == "images":
+            return {"original": self.original_images}
+        return {}
+
+
+def _covers(part: str, saved: dict | None, wanted: dict) -> bool:
+    """Do results fetched with `saved` options satisfy the `wanted` options?"""
+    if saved is None:  # record from an older version: options unknown, accept it
+        return True
+    if part == "top-comments":
+        return saved.get("n", 0) >= wanted["n"] and saved.get("replies", 0) >= wanted["replies"]
+    if part == "my-comments":
+        s, w = saved.get("max_replies", 0), wanted["max_replies"]
+        return s == -1 or (w != -1 and s >= w)
+    if part == "subtitles":
+        mode_ok = saved.get("mode") == wanted["mode"] or saved.get("mode") == "auto"
+        langs_ok = not saved.get("langs") or (wanted["langs"] and set(wanted["langs"]) <= set(saved["langs"]))
+        return bool(mode_ok and langs_ok)
+    if part == "lyrics":
+        return saved.get("mode") == wanted["mode"] or saved.get("mode") == "all"
+    return saved == wanted
+
+
+def legacy_parts(res: dict) -> dict[str, dict]:
+    """Infer part records for an info.json written before parts were tracked."""
+    parts: dict[str, dict] = {}
+    if res.get("status") not in ("ok", "partial"):
+        return parts
+
+    def rec(status: str, **extra: Any) -> dict:
+        return {"status": status, "at": res.get("fetched_at"), "params": None, **extra}
+
+    if res.get("metadata") or res.get("post"):
+        parts["metadata"] = rec("ok")
+    if res.get("thumbnail_file"):
+        parts["thumbnail"] = rec("ok")
+    if res.get("return_youtube_dislike"):
+        parts["dislikes"] = rec("ok")
+    comments = res.get("comments") or {}
+    if "error" not in comments:
+        if "top" in comments:  # options inferred from what was saved
+            top = comments["top"]
+            parts["top-comments"] = rec("ok")
+            parts["top-comments"]["params"] = {
+                "n": len(top), "replies": max((len(c.get("replies") or []) for c in top), default=0),
+            }
+        threads = comments.get("user_threads")
+        if threads is not None and not any(t.get("status") == "error" for t in threads):
+            parts["my-comments"] = rec("ok", ids=sorted(t.get("comment_id", "") for t in threads))
+    subs = res.get("subtitles")
+    if isinstance(subs, dict) and "error" not in subs:
+        parts["subtitles"] = rec("ok" if subs.get("tracks") else "none")
+    lyr = res.get("lyrics")
+    if isinstance(lyr, dict) and "error" not in lyr:
+        parts["lyrics"] = rec("ok" if lyr.get("file") else "none")
+    if res.get("post") is not None and "image_files" in res and all(res["image_files"]):
+        parts["images"] = rec("ok")
+    for k in ("banner", "avatar"):
+        if res.get(k + "_file"):
+            parts[k] = rec("ok")
+        elif res.get("metadata") is not None and (k + "_url") in res and not res.get(k + "_url"):
+            parts[k] = rec("none")
+    return parts
+
+
 BOT_CHECKS_BEFORE_STOP = 5
 _MUSIC_TITLE_RE = re.compile(
     r"official (music )?video|official audio|\baudio\b|lyrics?|\bft\.|\bfeat\.|music video|\bmv\b|клип|караоке",
     re.I,
 )
+_FINAL_THREAD_STATUSES = ("ok", "not_found_online", "reply_not_found_online", "no_comment_id_in_takeout")
 
 
 def write_atomic(path: Path, data: bytes | str) -> None:
@@ -1889,6 +2024,15 @@ def srt_to_text(srt: str) -> str:
             if line and (not out or out[-1] != line):
                 out.append(line)
     return "\n".join(out) + ("\n" if out else "")
+
+
+@dataclass
+class Plan:
+    """What has to be done for one item in this run."""
+
+    item: Item
+    prev: dict | None  # saved info.json (None = first time / --refresh)
+    todo: list[str]  # parts to fetch
 
 
 class Enricher:
@@ -1961,64 +2105,113 @@ class Enricher:
             if self._bot_checks >= BOT_CHECKS_BEFORE_STOP:
                 raise RateLimited("YouTube keeps asking to confirm you're not a bot")
 
-    # ---------------- bookkeeping ----------------
+    # ---------------- planning: which parts still have to be done ----------------
 
     def item_dir(self, item: Item) -> Path:
         return self.opt.out / f"{item.kind}s" / item.id
 
-    def saved_status(self, item: Item) -> str | None:
-        f = self.item_dir(item) / "info.json"
+    def load(self, item: Item) -> dict | None:
         try:
-            return json.loads(f.read_text("utf-8")).get("status")
+            return json.loads((self.item_dir(item) / "info.json").read_text("utf-8"))
         except (OSError, ValueError):
             return None
 
-    def done(self, item: Item, status: str | None = None) -> bool:
-        if self.opt.refresh:
+    def part_done(self, item: Item, part: str, rec: dict | None) -> bool:
+        if not rec or rec.get("status") not in PART_DONE:
             return False
-        status = status if status is not None else self.saved_status(item)
-        if status == "unavailable" and (
-            self.opt.retry_unavailable or (self.opt.retry_unavailable_videos and item.kind == "video")
-        ):
+        if not _covers(part, rec.get("params"), self.opt.part_params(part)):
             return False
-        return status in DONE_STATUSES
+        if part == "my-comments":  # a newer Takeout may contain comments not fetched yet
+            wanted = {uc.comment_id for uc in item.user_comments}
+            return wanted <= set(rec.get("ids") or [])
+        return True
 
-    def process(self, item: Item) -> dict:
+    def plan(self, item: Item) -> Plan:
+        selected = self.opt.selected(item.kind)
+        prev = None if self.opt.refresh else self.load(item)
+        if not selected:
+            return Plan(item, prev, [])
+        if prev is None:
+            return Plan(item, None, selected)
+        status = prev.get("status")
+        if status == "unavailable":
+            retry = self.opt.retry_unavailable or (self.opt.retry_unavailable_videos and item.kind == "video")
+            return Plan(item, prev, selected if retry else [])
+        if status not in ("ok", "partial"):  # error: base data never fetched
+            return Plan(item, prev, selected)
+        parts = prev.get("parts") or legacy_parts(prev)
+        return Plan(item, prev, [p for p in selected if not self.part_done(item, p, parts.get(p))])
+
+    def missing_parts(self, item: Item, res: dict) -> list[str]:
+        if res.get("status") == "unavailable":
+            return []
+        parts = res.get("parts") or legacy_parts(res)
+        return [p for p in self.opt.selected(item.kind) if not self.part_done(item, p, parts.get(p))]
+
+    # ---------------- processing ----------------
+
+    def process(self, plan: Plan) -> tuple[dict, dict[str, str]]:
+        """Fetch the planned parts, merge them into the saved info.json.
+        Returns (result, {part: status} for the parts handled in this run)."""
+        item = plan.item
         d = self.item_dir(item)
         d.mkdir(parents=True, exist_ok=True)
-        res: dict[str, Any] = {"kind": item.kind, "id": item.id, "fetched_at": now_iso(), "tool_version": __version__}
+        res: dict[str, Any] = dict(plan.prev or {})
+        res.update({"kind": item.kind, "id": item.id, "fetched_at": now_iso(), "tool_version": __version__})
+        parts: dict[str, dict] = dict(res.get("parts") or (legacy_parts(res) if plan.prev else {}))
+        before = {k: dict(v) for k, v in parts.items()}
+        handler = {"video": self._video, "post": self._post, "channel": self._channel}[item.kind]
         try:
-            {"video": self._video, "post": self._post, "channel": self._channel}[item.kind](item, d, res)
-            res.setdefault("status", "ok")
-            if res["status"] == "ok" and _has_partial_failure(res):
-                res["status"] = "partial"  # saved, but retried on the next run
+            handler(item, d, res, parts, plan.todo)
         except RateLimited:
             raise
         except Exception as e:
             log.debug("failure on %s %s", item.kind, item.id, exc_info=True)
-            res["status"] = "error"
-            res["error"] = f"{type(e).__name__}: {e}"
+            res["status"], res["error"] = "error", f"{type(e).__name__}: {e}"
+        res["parts"] = parts
+        if res.get("status") not in ("unavailable", "error"):
+            failed = [p for p in self.opt.selected(item.kind) if (parts.get(p) or {}).get("status") == "error"]
+            res["status"] = "partial" if failed else "ok"
+            if not failed:
+                res.pop("error", None)
         res["takeout"] = item.to_json()
         write_atomic(d / "info.json", json.dumps(res, ensure_ascii=False, indent=2))
-        return res
+        changed = {p: parts[p]["status"] for p in plan.todo if p in parts and parts[p] != before.get(p)}
+        return res, changed
+
+    def _record(self, parts: dict, part: str, status: str, error: Exception | str | None = None, **extra: Any) -> None:
+        rec: dict[str, Any] = {"status": status, "at": now_iso(), "params": self.opt.part_params(part), **extra}
+        if error is not None:
+            rec["error"] = error if isinstance(error, str) else f"{type(error).__name__}: {error}"
+        parts[part] = rec
+
+    def _run_parts(self, tasks: dict[str, Callable[[], Any]], parts: dict,
+                   apply: Callable[[str, Any], tuple[str, dict]]) -> None:
+        """Run part fetchers in parallel; `apply(part, value)` stores the value and
+        returns (status, extra record fields). Exceptions -> status 'error'."""
+        for part, (value, err) in run_tasks(tasks, width=max(1, len(tasks))).items():
+            if err is not None:
+                self._record(parts, part, "error", err)
+                continue
+            status, extra = apply(part, value)
+            self._record(parts, part, status, **extra)
 
     # ---------------- downloads ----------------
 
     _EXT = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "image/gif": ".gif", "image/avif": ".avif"}
 
     def download(self, url: str | None, dest_stem: Path) -> str | None:
-        """Download to dest_stem.<ext from content-type>; existing complete files are reused."""
+        """Download to dest_stem.<ext from content-type>; existing complete files are
+        reused. None if the server has no such file; network errors raise."""
         if not url:
             return None
         if not self.opt.refresh:
             for existing in dest_stem.parent.glob(dest_stem.name + ".*"):
                 if existing.suffix != ".part":
                     return existing.name
-        try:
-            r = self.http.request("media", "GET", url, timeout=60)
-        except requests.RequestException as e:
-            log.debug("download failed %s: %s", url, e)
-            return None
+        r = self.http.request("media", "GET", url, timeout=60)
+        if r.status_code >= 500 or r.status_code == 429:
+            raise RuntimeError(f"HTTP {r.status_code} for {url}")
         if r.status_code != 200 or not r.content:
             return None
         ctype = r.headers.get("content-type", "").split(";")[0].strip()
@@ -2029,37 +2222,60 @@ class Enricher:
 
     # ---------------- comments (shared by videos and posts) ----------------
 
-    def _comments(self, endpoint: str, token_fn: Callable[..., str], item: Item) -> dict:
+    def _top_comments(self, endpoint: str, token_fn: Callable[..., str]) -> dict:
         out: dict[str, Any] = {"sort": "top", "top": []}
-        if self.opt.top_comments > 0:
-            threads: list[dict] = []
-            for thread, page in self.yt.iter_threads(endpoint, token_fn(SORT_TOP)):
-                out.setdefault("total_count_text", page.get("count_text"))
-                threads.append(thread)
-                if len(threads) >= self.opt.top_comments:
-                    break
-            top = [dict(t["comment"]) for t in threads]
-            if self.opt.top_comment_replies:
-                need = [i for i, c in enumerate(top) if c.get("reply_count")]
+        if self.opt.top_comments <= 0:
+            return out
+        threads: list[dict] = []
+        for thread, page in self.yt.iter_threads(endpoint, token_fn(SORT_TOP)):
+            out.setdefault("total_count_text", page.get("count_text"))
+            threads.append(thread)
+            if len(threads) >= self.opt.top_comments:
+                break
+        top = [dict(t["comment"]) for t in threads]
+        if self.opt.top_comment_replies:
+            need = [i for i, c in enumerate(top) if c.get("reply_count")]
 
-                def fetch(i: int) -> list[dict]:
-                    try:
-                        return self.yt.replies(endpoint, threads[i], self.opt.top_comment_replies)
-                    except RateLimited:
-                        raise
-                    except Exception as e:
-                        log.debug("failed to fetch replies: %s", e)
-                        top[i]["replies_error"] = f"{type(e).__name__}: {e}"
-                        return []
+            def fetch(i: int) -> list[dict]:
+                return self.yt.replies(endpoint, threads[i], self.opt.top_comment_replies)
 
-                for i, replies in zip(need, parallel_map(fetch, need, self.width())):
-                    top[i]["replies"] = replies
-            out["top"] = top
-        if item.user_comments:
-            out["user_threads"] = parallel_map(
-                lambda uc: self._user_thread(endpoint, token_fn, uc), item.user_comments, self.width()
-            )
+            for i, replies in zip(need, parallel_map(fetch, need, self.width())):
+                top[i]["replies"] = replies
+        out["top"] = top
         return out
+
+    def _my_comments(self, endpoint: str, token_fn: Callable[..., str], item: Item, prev_threads: list[dict],
+                     reuse: bool) -> list[dict]:
+        """Your comment threads; threads already resolved earlier (with options that
+        still apply) are reused, only new or failed ones are fetched."""
+        known = {t.get("comment_id"): t for t in prev_threads if reuse and t.get("status") in _FINAL_THREAD_STATUSES}
+        todo = [uc for uc in item.user_comments if uc.comment_id not in known]
+        fetched = {t["comment_id"]: t for t in parallel_map(lambda uc: self._user_thread(endpoint, token_fn, uc), todo, self.width())}
+        return [fetched.get(uc.comment_id) or known[uc.comment_id] for uc in item.user_comments]
+
+    def _apply_comments(self, part: str, value: Any, res: dict) -> tuple[str, dict]:
+        comments = res.get("comments") if isinstance(res.get("comments"), dict) else {}
+        comments.pop("error", None)
+        if part == "top-comments":
+            comments.update(value)
+            res["comments"] = comments
+            return "ok", {}
+        comments["user_threads"] = value
+        res["comments"] = comments
+        status = "error" if any(t.get("status") == "error" for t in value) else ("ok" if value else "none")
+        done_ids = sorted(t["comment_id"] for t in value if t.get("status") in _FINAL_THREAD_STATUSES)
+        return status, {"ids": done_ids}
+
+    def _comment_tasks(self, todo: list[str], endpoint: str, token_fn: Callable[..., str], item: Item, res: dict) -> dict:
+        tasks: dict[str, Callable[[], Any]] = {}
+        if "top-comments" in todo:
+            tasks["top-comments"] = lambda: self._top_comments(endpoint, token_fn)
+        if "my-comments" in todo:
+            prev_threads = ((res.get("comments") or {}).get("user_threads")) or []
+            rec = (res.get("parts") or {}).get("my-comments") or {}
+            reuse = _covers("my-comments", rec.get("params"), self.opt.part_params("my-comments")) if rec else True
+            tasks["my-comments"] = lambda: self._my_comments(endpoint, token_fn, item, prev_threads, reuse)
+        return tasks
 
     def _user_thread(self, endpoint: str, token_fn: Callable[..., str], uc: UserComment) -> dict:
         res: dict[str, Any] = {"comment_id": uc.comment_id, "is_reply": uc.is_reply, "takeout_text": uc.text, "created": uc.created}
@@ -2119,48 +2335,84 @@ class Enricher:
         "media_type webpage_url thumbnail track artist artists album album_artist alt_title creators release_year"
     ).split()
 
-    def _video(self, item: Item, d: Path, res: dict) -> None:
+    def _video(self, item: Item, d: Path, res: dict, parts: dict, todo: list[str]) -> None:
         vid = item.id
         res["url"] = f"https://www.youtube.com/watch?v={vid}"
-        info, error = self.extract(res["url"])
-        if info is None:
-            res["error"] = error or "video unavailable"
-            res["status"] = classify_failure(res["error"])
-            self._note_bot_check(bool(BOT_CHECK_RE.search(res["error"])))
-        else:
-            self._note_bot_check(False)
-            meta = {k: info.get(k) for k in self.VIDEO_FIELDS if info.get(k) is not None}
-            if meta.get("media_type") is None and "/shorts/" in (info.get("webpage_url") or ""):
-                meta["media_type"] = "short"
-            res["metadata"] = meta
+        had_data = bool(res.get("metadata", {}).get("title")) and res.get("status") in ("ok", "partial")
+        info: dict | None = None
+        # subtitle URLs expire, so subtitles always need a fresh extraction
+        if "metadata" in todo or "subtitles" in todo or not had_data:
+            info, error = self.extract(res["url"])
+            self._note_bot_check(info is None and bool(BOT_CHECK_RE.search(error or "")))
+            if info is None:
+                failure = classify_failure(error)
+                if failure == "error" and had_data:
+                    # temporary: keep the saved data, retry the parts that needed it
+                    for p in ("metadata", "subtitles"):
+                        if p in todo:
+                            self._record(parts, p, "error", error)
+                    todo = [p for p in todo if p not in ("metadata", "subtitles")]
+                else:
+                    res["status"], res["error"] = failure, error or "video unavailable"
+                    if failure == "error":
+                        return  # nothing saved yet: retry everything next run
+                    # unavailable: old data (if any) is kept; RYD/thumbnails may still exist
+                    todo = [p for p in todo if p in ("thumbnail", "dislikes")]
+            else:
+                meta = {k: info.get(k) for k in self.VIDEO_FIELDS if info.get(k) is not None}
+                if meta.get("media_type") is None and "/shorts/" in (info.get("webpage_url") or ""):
+                    meta["media_type"] = "short"
+                old = res.get("metadata") or {}
+                if "dislike_count_estimate" in old and "dislikes" not in todo:
+                    meta["dislike_count_estimate"] = old["dislike_count_estimate"]
+                res["metadata"] = meta
+                res["status"] = "ok"
+                res.pop("error", None)
+                self._record(parts, "metadata", "ok")
+        meta = res.get("metadata") or {}
+        exists = bool(meta.get("title")) and res.get("status") != "unavailable"
 
+        token_fn = lambda sort, hl=None: video_comments_token(vid, sort, hl)  # noqa: E731
         tasks: dict[str, Callable[[], Any]] = {}
-        if self.opt.dislikes:
-            tasks["ryd"] = lambda: self._ryd(vid)
-        if self.opt.thumbnails:
-            tasks["thumbnail"] = lambda: self._thumbnail(vid, info, d)
-        if info and (self.opt.top_comments > 0 or item.user_comments):
-            tasks["comments"] = lambda: self._comments("next", lambda sort, hl=None: video_comments_token(vid, sort, hl), item)
-        if info and self.opt.subs != "none":
-            tasks["subtitles"] = lambda: self._subtitles(info, d)
-        if info and self._wants_lyrics(info, item):
-            tasks["lyrics"] = lambda: self._lyrics(vid, d)
-        results = run_tasks(tasks, width=len(tasks))
+        if "dislikes" in todo:
+            tasks["dislikes"] = lambda: self._ryd(vid)
+        if "thumbnail" in todo:
+            tasks["thumbnail"] = lambda: self._thumbnail(vid, meta, d)
+        if exists:
+            tasks.update(self._comment_tasks(todo, "next", token_fn, item, res))
+            if "subtitles" in todo and info is not None:
+                tasks["subtitles"] = lambda: self._subtitles(info, d)
+            if "lyrics" in todo:
+                tasks["lyrics"] = lambda: self._lyrics(vid, d) if self._wants_lyrics(meta, item) else None
 
-        ryd, _ = results.get("ryd", (None, None))
-        if ryd and (info or ryd.get("dislikes") or ryd.get("likes")):
-            res.setdefault("metadata", {})["dislike_count_estimate"] = ryd.get("dislikes")
-            res["return_youtube_dislike"] = ryd
-        thumb, _ = results.get("thumbnail", (None, None))
-        if thumb:
-            res["thumbnail_file"], res["thumbnail_url"] = thumb
-        for key in ("comments", "subtitles", "lyrics"):
-            if key in results:
-                value, err = results[key]
-                res[key] = {"error": f"{type(err).__name__}: {err}"} if err else value
+        def apply(part: str, value: Any) -> tuple[str, dict]:
+            if part == "dislikes":
+                if not value or not (exists or value.get("dislikes") or value.get("likes")):
+                    return "none", {}
+                res.setdefault("metadata", {})["dislike_count_estimate"] = value.get("dislikes")
+                res["return_youtube_dislike"] = value
+                return "ok", {}
+            if part == "thumbnail":
+                if not value:
+                    return "none", {}
+                res["thumbnail_file"], res["thumbnail_url"] = value
+                return "ok", {}
+            if part == "subtitles":
+                res["subtitles"] = value
+                if any(str(t.get("error", "")).startswith("HTTP") for t in value["tracks"]):
+                    return "error", {"error": "some subtitle downloads failed"}
+                return ("ok" if any(t.get("file") for t in value["tracks"]) else "none"), {}
+            if part == "lyrics":
+                if value is None:
+                    return "skipped", {}  # not a music video (--lyrics auto)
+                res["lyrics"] = value
+                return ("ok" if value.get("file") else "none"), {}
+            return self._apply_comments(part, value, res)
 
-    def _thumbnail(self, vid: str, info: dict | None, d: Path) -> tuple[str, str] | None:
-        cands = [info.get("thumbnail")] if info else []
+        self._run_parts(tasks, parts, apply)
+
+    def _thumbnail(self, vid: str, meta: dict, d: Path) -> tuple[str, str] | None:
+        cands = [meta.get("thumbnail")] if meta.get("thumbnail") else []
         cands += [f"https://i.ytimg.com/vi/{vid}/maxresdefault.jpg", f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"]
         for u in cands:
             name = self.download(u, d / "thumbnail")
@@ -2169,14 +2421,13 @@ class Enricher:
         return None
 
     def _ryd(self, vid: str) -> dict | None:
-        try:
-            r = self.http.request("ryd", "GET", "https://returnyoutubedislikeapi.com/votes", params={"videoId": vid}, timeout=20)
-            if r.status_code == 200:
-                j = r.json()
-                return {k: j.get(k) for k in ("likes", "dislikes", "rating", "viewCount", "deleted", "dateCreated")}
-        except (requests.RequestException, ValueError):
-            pass
-        return None
+        r = self.http.request("ryd", "GET", "https://returnyoutubedislikeapi.com/votes", params={"videoId": vid}, timeout=20)
+        if r.status_code >= 500 or r.status_code == 429:
+            raise RuntimeError(f"Return YouTube Dislike: HTTP {r.status_code}")
+        if r.status_code != 200:
+            return None
+        j = r.json()
+        return {k: j.get(k) for k in ("likes", "dislikes", "rating", "viewCount", "deleted", "dateCreated")}
 
     # ---------------- subtitles ----------------
 
@@ -2236,18 +2487,16 @@ class Enricher:
 
     # ---------------- lyrics ----------------
 
-    def _wants_lyrics(self, info: dict, item: Item) -> bool:
+    def _wants_lyrics(self, meta: dict, item: Item) -> bool:
         if self.opt.lyrics == "all":
             return True
-        if self.opt.lyrics != "auto":
-            return False
-        cats = [c.lower() for c in info.get("categories") or []]
-        channel = info.get("channel") or info.get("uploader") or ""
+        cats = [c.lower() for c in meta.get("categories") or []]
+        channel = meta.get("channel") or meta.get("uploader") or ""
         return bool(
             "music" in cats
-            or info.get("track") or info.get("artist") or info.get("artists")
+            or meta.get("track") or meta.get("artist") or meta.get("artists")
             or channel.endswith(" - Topic") or "vevo" in channel.lower()
-            or _MUSIC_TITLE_RE.search(info.get("title") or "")
+            or _MUSIC_TITLE_RE.search(meta.get("title") or "")
             or any("music" in s.lower() for s in item.sources)
         )
 
@@ -2266,29 +2515,38 @@ class Enricher:
             name = self.download(u.split("=")[0] + "=s0", d / f"image_{i}")
         return name or self.download(u, d / f"image_{i}")
 
-    def _post(self, item: Item, d: Path, res: dict) -> None:
+    def _post(self, item: Item, d: Path, res: dict, parts: dict, todo: list[str]) -> None:
         res["url"] = f"https://www.youtube.com/post/{item.id}"
-        got = self.yt.post(item.id)
-        if got["status"] != "ok":
-            res["status"] = got["status"]
-            res["error"] = got.get("error")
-            return
-        post = got["post"]
-        res["post"] = post
+        if "metadata" in todo or not res.get("post") or res.get("status") not in ("ok", "partial"):
+            got = self.yt.post(item.id)
+            if got["status"] != "ok":
+                # a previously saved copy of a since-deleted post is kept as is
+                res["status"], res["error"] = got["status"], got.get("error")
+                return
+            res["post"] = got["post"]
+            res["status"] = "ok"
+            res.pop("error", None)
+            self._record(parts, "metadata", "ok")
+        post = res["post"]
         tasks: dict[str, Callable[[], Any]] = {}
-        if self.opt.thumbnails and post["images"]:
+        if "images" in todo:
             tasks["images"] = lambda: parallel_map(
-                lambda iu: self._download_post_image(iu[0], iu[1], d), list(enumerate(post["images"], 1)), self.width("media")
+                lambda iu: self._download_post_image(iu[0], iu[1], d), list(enumerate(post.get("images") or [], 1)), self.width("media")
             )
-        ucid = post["author"].get("channel_id")
-        if ucid and (self.opt.top_comments > 0 or item.user_comments):
-            tasks["comments"] = lambda: self._comments("browse", lambda sort, hl=None: post_comments_token(item.id, ucid, sort, hl), item)
-        results = run_tasks(tasks, width=len(tasks))
-        if "images" in results:
-            res["image_files"] = results["images"][0] or []
-        if "comments" in results:
-            value, err = results["comments"]
-            res["comments"] = {"error": f"{type(err).__name__}: {err}"} if err else value
+        ucid = (post.get("author") or {}).get("channel_id")
+        if ucid:
+            token_fn = lambda sort, hl=None: post_comments_token(item.id, ucid, sort, hl)  # noqa: E731
+            tasks.update(self._comment_tasks(todo, "browse", token_fn, item, res))
+
+        def apply(part: str, value: Any) -> tuple[str, dict]:
+            if part == "images":
+                res["image_files"] = value
+                if not value:
+                    return "none", {}
+                return ("ok" if all(value) else "error"), ({} if all(value) else {"error": "some images missing"})
+            return self._apply_comments(part, value, res)
+
+        self._run_parts(tasks, parts, apply)
 
     # ---------------- channel ----------------
 
@@ -2297,36 +2555,28 @@ class Enricher:
         "channel_url channel_is_verified tags availability"
     ).split()
 
-    def _channel(self, item: Item, d: Path, res: dict) -> None:
+    def _channel(self, item: Item, d: Path, res: dict, parts: dict, todo: list[str]) -> None:
         url = f"https://www.youtube.com/channel/{item.id}"
         res["url"] = url
-        info, error = self.extract(url, flat=True)
-        if info is None:
-            res["error"] = error or "channel unavailable"
-            res["status"] = classify_failure(res["error"])
-            return
-        res["metadata"] = {k: info.get(k) for k in self.CHANNEL_FIELDS if info.get(k) is not None}
-        thumbs = {t.get("id"): t.get("url") for t in info.get("thumbnails") or []}
-        res["banner_url"] = thumbs.get("banner_uncropped")
-        res["avatar_url"] = thumbs.get("avatar_uncropped")
-        if self.opt.thumbnails:
-            jobs = [(k, res[k + "_url"]) for k in ("banner", "avatar") if res[k + "_url"]]
-            names = parallel_map(lambda job: self.download(job[1], d / job[0]), jobs, len(jobs))
-            for (k, _), name in zip(jobs, names):
-                res[k + "_file"] = name
+        if "metadata" in todo or "banner_url" not in res or res.get("status") not in ("ok", "partial"):
+            info, error = self.extract(url, flat=True)
+            if info is None:
+                res["status"], res["error"] = classify_failure(error), error or "channel unavailable"
+                return
+            res["metadata"] = {k: info.get(k) for k in self.CHANNEL_FIELDS if info.get(k) is not None}
+            thumbs = {t.get("id"): t.get("url") for t in info.get("thumbnails") or []}
+            res["banner_url"] = thumbs.get("banner_uncropped")
+            res["avatar_url"] = thumbs.get("avatar_uncropped")
+            res["status"] = "ok"
+            res.pop("error", None)
+            self._record(parts, "metadata", "ok")
+        tasks = {k: (lambda k=k: self.download(res.get(k + "_url"), d / k)) for k in ("banner", "avatar") if k in todo}
 
+        def apply(part: str, value: Any) -> tuple[str, dict]:
+            res[part + "_file"] = value
+            return ("ok" if value else "none"), {}
 
-def _has_partial_failure(res: dict) -> bool:
-    """True if a sub-part (comments, a comment thread, subtitles, lyrics) failed."""
-    for key in ("comments", "subtitles", "lyrics"):
-        part = res.get(key)
-        if isinstance(part, dict) and "error" in part:
-            return True
-    comments = res.get("comments") or {}
-    if any(t.get("status") == "error" for t in comments.get("user_threads") or []):
-        return True
-    # a subtitle track that failed to download (not one that simply has no srt/vtt)
-    return any(str(t.get("error", "")).startswith("HTTP") for t in (res.get("subtitles") or {}).get("tracks") or [])
+        self._run_parts(tasks, parts, apply)
 
 
 class _YdlLogger:
@@ -2363,7 +2613,7 @@ def _clean_ydl_msg(msg: str) -> str:
 # --------------------------------------------------------------------------------------
 
 
-def write_summary(out: Path, inv: Inventory) -> None:
+def write_summary(out: Path, inv: Inventory, enr: Enricher) -> None:
     rows = []
     for kind in ("video", "post", "channel"):
         for id_, item in inv.items[kind].items():
@@ -2392,6 +2642,7 @@ def write_summary(out: Path, inv: Inventory) -> None:
                     "dislikes_estimate": meta.get("dislike_count_estimate", ""),
                     "subtitles": ";".join(t["lang"] + (".auto" if t.get("auto_generated") else "") for t in tracks if t.get("file")),
                     "lyrics": "yes" if (info.get("lyrics") or {}).get("file") else "",
+                    "missing_parts": ";".join(enr.missing_parts(item, info)) if info else ";".join(enr.opt.selected(kind)),
                     "error": info.get("error", ""),
                 }
             )
@@ -2437,16 +2688,19 @@ def main(argv: list[str] | None = None) -> int:
                    help="minimum seconds between the starts of two YouTube requests (API and yt-dlp), on top of the adaptive limits")
     g.add_argument("--no-network-probe", action="store_true", help="skip the startup latency/bandwidth measurement")
     g.add_argument("--reset-stats", action="store_true", help="ignore what previous runs learned (OUT/.adaptive_state.json)")
-    m = ap.add_argument_group("content")
-    m.add_argument("--subs", choices=("none", "manual", "auto"), default="auto",
-                   help="subtitles: none, creator-made only, or creator-made + auto-generated in the original language")
+    m = ap.add_argument_group("content (parts)")
+    m.add_argument("--include", type=parse_parts, default="all", metavar="PARTS",
+                   help="only these parts, comma-separated: " + ", ".join(ALL_PARTS)
+                   + "; groups: comments, media, all. Singular/plural both work")
+    m.add_argument("--exclude", type=parse_parts, default="", metavar="PARTS",
+                   help="leave out these parts, e.g. 'banner,thumbnail'")
+    m.add_argument("--subs", choices=("manual", "auto"), default="auto",
+                   help="subtitles: creator-made only, or creator-made + auto-generated in the original language")
     m.add_argument("--sub-langs", default="", metavar="LANGS",
                    help="comma-separated subtitle languages to keep, e.g. 'en,ru' (prefix match: en = en-US, en-GB); empty = all")
-    m.add_argument("--lyrics", choices=("none", "auto", "all"), default="auto",
+    m.add_argument("--lyrics", choices=("auto", "all"), default="auto",
                    help="song lyrics from YouTube Music: auto = only for music-like videos, all = try every video")
-    m.add_argument("--no-thumbnails", action="store_true", help="skip downloading thumbnails/banners/post images")
     m.add_argument("--resized-images", action="store_true", help="save post images as served (webp) instead of originals")
-    m.add_argument("--no-dislikes", action="store_true", help="skip the Return YouTube Dislike lookup")
     ap.add_argument("--cookies", help="Netscape cookies.txt for youtube.com (age-restricted/members content, fewer rate limits)")
     ap.add_argument("--lang", default="en", help="interface language for relative dates/labels")
     ap.add_argument("--region", default="US", help="content region")
@@ -2511,18 +2765,21 @@ def main(argv: list[str] | None = None) -> int:
             items = items[: args.limit]
         todo += items
 
-    if "video" in kinds or "channel" in kinds:
+    if any(i.kind in ("video", "channel") for i in todo):
         if not _installed("yt_dlp"):
             log.error("yt-dlp is required for video/channel metadata: pip install -U yt-dlp")
             return 1
 
+    selected_parts = args.include - args.exclude
+    if not selected_parts:
+        log.error("--include/--exclude leave no parts to fetch")
+        return 1
     opt = Options(
         out=out,
+        parts=frozenset(selected_parts),
         top_comments=args.top_comments,
         top_comment_replies=args.top_comment_replies,
         max_replies=args.max_replies,
-        thumbnails=not args.no_thumbnails,
-        dislikes=not args.no_dislikes,
         original_images=not args.resized_images,
         subs=args.subs,
         sub_langs=tuple(x.strip().lower() for x in args.sub_langs.split(",") if x.strip()),
@@ -2543,11 +2800,19 @@ def main(argv: list[str] | None = None) -> int:
     limiters = build_limiters(state, network, args.concurrency, args.sleep)
     enr = Enricher(opt, limiters)
 
-    statuses = {(i.kind, i.id): enr.saved_status(i) for i in todo}
-    pending = [i for i in todo if not enr.done(i, statuses[(i.kind, i.id)])]
-    retrying = sum(1 for i in pending if statuses[(i.kind, i.id)] == "unavailable")
+    plans = [enr.plan(i) for i in todo]
+    pending = [pl for pl in plans if pl.todo]
+    retrying = sum(1 for pl in pending if (pl.prev or {}).get("status") == "unavailable")
     if retrying:
         log.info("Retrying %d items previously marked as unavailable.", retrying)
+    part_todo: dict[str, int] = {}
+    for pl in pending:
+        for p in pl.todo:
+            key = f"{pl.item.kind} metadata" if p == "metadata" else p
+            part_todo[key] = part_todo.get(key, 0) + 1
+    log.info("Parts: %s", ", ".join(sorted(selected_parts, key=ALL_PARTS.index)))
+    if part_todo:
+        log.info("Missing: %s", ", ".join(f"{k} x{v}" for k, v in part_todo.items()))
 
     history = state.worker_history()
     if args.workers:
@@ -2561,7 +2826,7 @@ def main(argv: list[str] | None = None) -> int:
     if network and network.get("rtt_ms"):
         log.info("Network: %s ms to YouTube, ~%s Mbit/s", network["rtt_ms"], network.get("bandwidth_mbps") or "?")
     log.info(
-        "%d items to process (%d already done). Starting with %d workers (%s); request limits: %s%s",
+        "%d items need work (%d complete). Starting with %d workers (%s); request limits: %s%s",
         len(pending),
         len(todo) - len(pending),
         governor.workers,
@@ -2571,19 +2836,22 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     stats: dict[str, int] = {}
+    part_stats: dict[str, dict[str, int]] = {}
     unavailable_reasons: dict[str, int] = {}
     stats_lock = threading.Lock()
     stop = threading.Event()
     started_at, t0 = now_iso(), time.monotonic()
     last_save = [time.monotonic()]
 
-    def report(item: Item, r: dict) -> None:
+    def report(item: Item, r: dict, changed: dict[str, str]) -> None:
         st = r.get("status", "?")
         clean_err = " ".join(str(r.get("error") or "").split())
         with stats_lock:
             stats[st] = stats.get(st, 0) + 1
             if st == "unavailable" and clean_err:
                 unavailable_reasons[clean_err] = unavailable_reasons.get(clean_err, 0) + 1
+            for p, pst in changed.items():
+                part_stats.setdefault(p, {})[pst] = part_stats.setdefault(p, {}).get(pst, 0) + 1
         title = (r.get("metadata") or {}).get("title") or ((r.get("post") or {}).get("text") or "")[:60] or item.title or ""
         extra = ""
         ut = (r.get("comments") or {}).get("user_threads")
@@ -2594,7 +2862,12 @@ def main(argv: list[str] | None = None) -> int:
             extra += f" | subs: {len(subs)}"
         if (r.get("lyrics") or {}).get("file"):
             extra += " | lyrics"
-        reason = f" | reason: {clean_err}" if clean_err and (st in ("unavailable", "error") or args.verbose) else ""
+        if changed:
+            extra += " | parts: " + " ".join(f"{p}:{pst}" for p, pst in changed.items())
+        if st == "partial":
+            failed = [p for p, rec in (r.get("parts") or {}).items() if rec.get("status") == "error" and p in opt.parts]
+            clean_err = clean_err or "; ".join(f"{p}: {r['parts'][p].get('error', 'failed')}" for p in failed)
+        reason = f" | reason: {clean_err}" if clean_err and (st in ("unavailable", "error", "partial") or args.verbose) else ""
         log.info("[%s] %-7s %s %s%s%s", st, item.kind, item.id, title[:60].replace("\n", " "), extra, reason)
         if args.verbose and st in ("ok", "partial"):
             meta = r.get("metadata") or {}
@@ -2612,12 +2885,13 @@ def main(argv: list[str] | None = None) -> int:
             if details:
                 log.debug("       ↳ %s", ", ".join(details))
 
-    def work(item: Item) -> None:
+    def work(plan: Plan) -> None:
+        item = plan.item
         with governor.gate.enter():
             if stop.is_set():
                 return
             try:
-                r = enr.process(item)
+                r, changed = enr.process(plan)
             except RateLimited as e:
                 if not stop.is_set():
                     log.error("Rate limited by YouTube (%s). Stopping; re-run later to resume (or use --cookies).", e)
@@ -2628,14 +2902,14 @@ def main(argv: list[str] | None = None) -> int:
                 return
             finally:
                 governor.item_finished()
-            report(item, r)
+            report(item, r, changed)
             if time.monotonic() - last_save[0] > 60:  # keep learned stats even if the run gets killed
                 last_save[0] = time.monotonic()
                 state.save(limiters, governor, network)
 
     ex = cf.ThreadPoolExecutor(max_workers=governor.max_workers)
     try:
-        futures = [ex.submit(work, item) for item in pending]
+        futures = [ex.submit(work, pl) for pl in pending]
         for f in cf.as_completed(futures):
             f.result()
             if stop.is_set():
@@ -2658,8 +2932,15 @@ def main(argv: list[str] | None = None) -> int:
         "stopped_early": stop.is_set(),
     }
     state.save(limiters, governor, network, run_info if governor.done else None)
-    write_summary(out, inv)
-    log.info("Done: %s. Output in %s", ", ".join(f"{k}={v}" for k, v in sorted(stats.items())) or "nothing new", out.resolve())
+    write_summary(out, inv, enr)
+    if not pending:
+        log.info("Done: all selected parts are complete, nothing to fetch. Output in %s", out.resolve())
+    else:
+        log.info("Done: %s. Output in %s", ", ".join(f"{k}={v}" for k, v in sorted(stats.items())) or "nothing processed", out.resolve())
+    if part_stats:
+        log.info("Parts fetched: %s", "; ".join(
+            f"{p} " + ", ".join(f"{k}={v}" for k, v in sorted(c.items())) for p, c in sorted(part_stats.items(), key=lambda kv: ALL_PARTS.index(kv[0]))
+        ))
     if governor.done:
         w = run_info["workers"]
         log.info(

@@ -33,12 +33,42 @@ python yt_takeout_enrich.py Takeout --dry-run        # writes enriched/inventory
 # Only things you commented on, 50 top comments each, with 5 replies per top comment
 python yt_takeout_enrich.py Takeout --only-commented -n 50 --top-comment-replies 5
 
+# Only some parts, or everything except some parts (see "Parts" below)
+python yt_takeout_enrich.py Takeout --include subtitles,comments
+python yt_takeout_enrich.py Takeout --exclude banner,thumbnail
+
 # Skip watch history (it can hold tens of thousands of videos)
 python yt_takeout_enrich.py Takeout --exclude-files watch-history --exclude-files "My Activity"
 python yt_takeout_enrich.py Takeout --exclude-files история-просмотров      # Russian export
 ```
 
-The script is **resumable**. Finished items are skipped on the next run. Items that failed temporarily (`error`) and items where a part failed (`partial`, e.g. comments or a subtitle download) are retried. If YouTube keeps rate-limiting, the script stops cleanly and you can just run it again later. Ctrl+C finishes the items in progress and stops. Videos and posts you commented on are processed first. Use `--retry-unavailable` (or `--retry-unavailable-videos`) to re-parse items that were marked as unavailable (e.g. after adding `--cookies`).
+The script is **resumable**, per part. Each `info.json` records every part it fetched, with its status and the options used. On the next run, only the parts that are missing, failed, or were fetched with options that don't cover the current ones are fetched; everything else is kept. Items that failed temporarily (`error`) are retried completely. If YouTube keeps rate-limiting, the script stops cleanly and you can just run it again later. Ctrl+C finishes the items in progress and stops. Videos and posts you commented on are processed first. Use `--retry-unavailable` (or `--retry-unavailable-videos`) to re-parse items that were marked as unavailable (e.g. after adding `--cookies`).
+
+### Parts
+
+| Part | Items | What |
+|---|---|---|
+| `metadata` | all | video details (yt-dlp), post content, channel details |
+| `thumbnail` | videos | thumbnail image |
+| `dislikes` | videos | Return YouTube Dislike estimate |
+| `top-comments` | videos, posts | top N comments (`-n`, `--top-comment-replies`) |
+| `my-comments` | videos, posts | your comments with replies / the comment you replied to (`--max-replies`) |
+| `subtitles` | videos | subtitle files + transcripts (`--subs`, `--sub-langs`) |
+| `lyrics` | videos | song lyrics (`--lyrics`) |
+| `images` | posts | post images (`--resized-images`) |
+| `banner`, `avatar` | channels | channel images |
+
+Groups: `comments` (= `top-comments,my-comments`), `media` (= `thumbnail,images,banner,avatar`), `all`. Names can be singular or plural (`subtitle`, `comment`, `banners`).
+
+`--include` selects parts (default: all) and `--exclude` removes parts from that selection. Excluded parts are not deleted from existing output, just not fetched. Item kinds with no selected part are skipped: `--include subtitles` doesn't touch channels or posts. Items still get their metadata fetched when a selected part needs it: subtitles need a fresh extraction because their URLs expire, and comments need to know the video exists.
+
+When is a part complete?
+
+* **status:** `ok`, `none` (nothing to fetch: no subtitles, no lyrics, no banner) or `skipped` (lyrics of a non-music video under `--lyrics auto`).
+* **options:** its saved options cover the current ones. 20 saved top comments cover `-n 10` but not `-n 50`. `--subs auto` covers `manual`. `--lyrics all` covers `auto`. `--sub-langs en` doesn't cover "all languages".
+* **my-comments:** every comment of yours that is in the Takeout has been looked up. A newer Takeout with new comments fetches only the new threads.
+
+Output from older versions of the script, which has no part records, is understood: the parts it contains count as done (options inferred where possible), and the missing ones, such as `subtitles` and `lyrics`, are fetched. The log lists what is missing before the run (`Missing: subtitles x120, lyrics x120`), the parts each item got (`parts: subtitles:ok lyrics:skipped`), and a per-part summary at the end. `summary.csv` has a `missing_parts` column.
 
 ### Speed: adaptive by default
 
@@ -62,9 +92,11 @@ The log shows the network measurement, the starting values and their source, eve
 | `--only-commented` | off | only videos/posts that have your comments |
 | `--exclude-files SUBSTR` | – | skip Takeout files whose path contains SUBSTR |
 | `--limit N` | 0 | at most N items per kind (for testing) |
-| `--subs` | auto | `none`, `manual` (creator-made subtitles) or `auto` (creator-made plus auto-generated captions in the video's original language) |
+| `--include PARTS` | all | only these parts (see "Parts") |
+| `--exclude PARTS` | – | leave out these parts |
+| `--subs` | auto | `manual` (creator-made subtitles) or `auto` (creator-made plus auto-generated captions in the video's original language) |
 | `--sub-langs` | all | subtitle languages to keep, e.g. `en,ru` (prefix match: `en` covers `en-US`, `en-GB`) |
-| `--lyrics` | auto | song lyrics from YouTube Music: `auto` for music-like videos (Music category, track/artist metadata, "- Topic"/VEVO channels, "official video/audio", "lyrics", "feat." in the title), `all` for every video, `none` |
+| `--lyrics` | auto | song lyrics from YouTube Music: `auto` for music-like videos (Music category, track/artist metadata, "- Topic"/VEVO channels, "official video/audio", "lyrics", "feat." in the title) or `all` for every video |
 | `--workers` | auto | items processed in parallel; `auto` adapts (see above), a number fixes it |
 | `--max-workers` | 12 | upper bound for `--workers auto` |
 | `--concurrency` / `--parallel-requests` | auto | YouTube API requests in flight; `auto` adapts, a number fixes it |
@@ -73,7 +105,7 @@ The log shows the network measurement, the starting values and their source, eve
 | `--cookies cookies.txt` | – | Netscape cookie file: age-restricted and members-only content, fewer rate limits |
 | `--retry-unavailable` | off | re-parse all items previously marked as unavailable (videos, posts, channels) |
 | `--retry-unavailable-videos` | off | re-parse only videos previously marked as unavailable |
-| `--no-thumbnails`, `--resized-images`, `--no-dislikes` | – | skip media, keep post images as webp, skip the RYD lookup |
+| `--resized-images` | off | keep post images as served (webp) instead of the originals |
 | `--lang` / `--region` | en / US | language of comment dates and labels ("3 years ago" or, with `ru`, "3 года назад"). Video and channel metadata are always fetched in English so that counts parse reliably |
 | `-v / --verbose` | off | verbose output: displays reasons, video stats, and debug logs (use `-vv` for library debug) |
 
@@ -95,6 +127,8 @@ enriched/
 ```jsonc
 {
   "kind": "video", "id": "dQw4w9WgXcQ", "status": "ok",          // ok | partial | unavailable | error
+  "parts": { "subtitles": { "status": "ok", "at": "2026-11-24T06:19:26+00:00", "params": { "mode": "auto", "langs": [] } },
+             "lyrics": { "status": "skipped", ... }, ... },     // ok | none | skipped | error
   "metadata": { "title": "...", "description": "...", "like_count": 19501188,
                 "dislike_count_estimate": 521783, "view_count": 1836270607, "tags": [...], ... },
   "thumbnail_file": "thumbnail.jpg",
@@ -125,7 +159,7 @@ enriched/
 Item `status`:
 
 * `ok` – everything was fetched.
-* `partial` – saved, but a part (comments, one of your threads, a subtitle file, lyrics) failed; retried on the next run.
+* `partial` – saved, but a selected part failed (see `parts.<name>.error`); only the failed parts are retried on the next run.
 * `unavailable` – a permanent reason (removed, private, terminated, age-restricted without cookies, ...); not retried.
 * `error` – a temporary failure (bot check, rate limit, network, yt-dlp hiccup); retried on the next run.
 
